@@ -1,29 +1,23 @@
 name: 签到
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '10 17 * * *'
+    - cron: "50 4 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
 permissions:
   contents: read
   actions: write
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v5
-
-      - name: 随机延时（仅定时触发，最高 20 min）
-        if: github.event_name == 'schedule'
-        run: |
-          $delay = Get-Random -Minimum 0 -Maximum 1200
-          Write-Output "随机延时: ${delay}s ($([math]::Round($delay/60, 1)) 分钟)"
-          Start-Sleep -Seconds $delay
-        shell: pwsh
+        uses: actions/checkout@v6
 
       - name: 创建 Node 环境
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: 'npm'
@@ -31,7 +25,7 @@ jobs:
 
       - name: 缓存依赖
         id: cache-npm
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ./api/node_modules
           key: ${{ runner.os }}-node-${{ hashFiles('./api/package-lock.json') }}
@@ -39,8 +33,8 @@ jobs:
             ${{ runner.os }}-node-
 
       - name: 安装依赖
-        if: ${{ steps.cache-npm.outputs.cache-hit != 'true' }}
         run: npm run install
+        if: ${{ steps.cache-npm.outputs.cache-hit != 'true' }}
 
       - name: 执行签到
         run: npm run main
