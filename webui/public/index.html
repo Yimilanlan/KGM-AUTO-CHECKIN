@@ -77,10 +77,33 @@
 
     <!-- 一键签到 -->
     <section id="panel-run" class="panel">
-      <div class="panel-head"><span class="comment">// 一键签到</span><span class="dim"> — 实时输出与 GitHub Actions / 定时任务完全一致</span></div>
+      <div class="panel-head">
+        <span class="comment">// 一键签到</span><span class="dim"> — 填入酷狗ID 即可签到该账号（每个 ID 每天 2 次）</span>
+        <button id="btn-run-admin-toggle" class="btn ghost icon-btn" aria-pressed="false"
+                title="管理员：签到全部账号" aria-label="管理员：签到全部账号">⚙</button>
+      </div>
+
+      <!-- 模式一：指定 userid -->
+      <div class="run-block">
+        <div class="row">
+          <input id="run-userid" class="input" type="text" inputmode="numeric" placeholder="酷狗ID（userid）" autocomplete="off" />
+          <button id="btn-run-one" class="btn primary big">[ ▶ 签到该账号 ]</button>
+          <span id="run-one-quota" class="dim"></span>
+        </div>
+      </div>
+
+      <!-- 模式二：全部账号（需 admin 验证）；默认隐藏，点右上角 ⚙ 展开 -->
+      <div id="run-admin-panel" class="run-block" hidden>
+        <div class="run-block-head"><span class="comment">// 全部账号签到</span><span class="dim"> — 需 admin 账号与密码</span></div>
+        <div class="row">
+          <input id="run-admin-key" class="input" type="password" placeholder="admin 密码" autocomplete="current-password" />
+          <button id="btn-run-all" class="btn">[ ▶ 签到全部账号 ]</button>
+        </div>
+      </div>
+
       <div class="row">
-        <button id="btn-run" class="btn primary big">[ ▶ 立即签到 ]</button>
         <button id="btn-clear-log" class="btn ghost">[ 清屏 ]</button>
+        <button id="btn-toggle-verbose" class="btn ghost" aria-pressed="false" title="显示/隐藏逐次领取等详细日志">[ 详细日志 ]</button>
         <span id="run-state" class="dim">// 空闲</span>
       </div>
       <div class="term">
@@ -118,6 +141,11 @@
 
       <div id="accounts-content" hidden>
         <div id="accounts-default-pwd-warn" class="lock-row warn" hidden></div>
+        <div class="row">
+          <input id="accounts-search" class="input" type="search"
+                 placeholder="搜索昵称或酷狗ID…" autocomplete="off" />
+          <span id="accounts-search-count" class="dim"></span>
+        </div>
         <div id="account-list">
           <div class="empty dim">// 加载中…</div>
         </div>
@@ -128,7 +156,7 @@
         </div>
       </div>
 
-      <p class="tip">⚠ 未修改过密码的账号默认密码为酷狗ID，建议登录后立即修改；userid 与 token 已脱敏显示；删除账号不影响酷狗 APP 登录状态</p>
+      <p class="tip">⚠ 未修改过密码的账号默认密码为酷狗ID，建议登录后立即修改；token 已脱敏显示；删除账号不影响酷狗 APP 登录状态</p>
     </section>
   </main>
 
@@ -151,6 +179,7 @@
       </div>
       <div class="row">
         <button id="btn-auth-ok" class="btn primary">[ 确 认 ]</button>
+        <button id="btn-auth-cancel" class="btn ghost">[ 取消 ]</button>
       </div>
       <p id="auth-err" class="tip err"></p>
     </div>

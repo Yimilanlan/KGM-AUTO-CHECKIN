@@ -146,6 +146,10 @@ main {
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
 .panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
   font-size: 15px;
   margin-bottom: 18px;
   padding-bottom: 10px;
@@ -177,6 +181,51 @@ main {
 }
 
 .inline-label { color: var(--dim); font-size: 13px; }
+
+/* 签到页的两种模式分区：单账号 / 全部账号，用左侧竖线区分，避免误点 */
+.run-block {
+  border-left: 2px solid var(--border-light);
+  padding-left: 12px;
+  margin-bottom: 14px;
+}
+.run-block-head {
+  font-size: 13px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.run-block .row { margin-bottom: 0; }
+.run-block .input { max-width: 240px; }
+
+/* 方案 B：面板标题右侧的齿轮图标按钮（管理员功能入口） */
+.icon-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 15px;
+  line-height: 1.2;
+  color: var(--dim);
+  border-color: transparent;
+  background: transparent;
+}
+.icon-btn:hover:not(:disabled) {
+  color: var(--green);
+  border-color: var(--border-light);
+  box-shadow: none;
+}
+.icon-btn.active {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+/* 搜索命中高亮 */
+mark.hit {
+  background: rgba(210, 168, 255, 0.28);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
 
 .field { margin-bottom: 16px; }
 .field > label {
@@ -324,6 +373,30 @@ select.input { width: auto; min-width: 80px; }
 .term-body .line.ok { color: var(--green); }
 .term-body .line.err { color: var(--red); }
 .term-body .line .ts { color: #484f58; }
+
+/* 账号序号「[#4/28]」定宽显示：同一账号及不同账号的后续文字都从同一列开始。
+   用固定像素宽度而非 ch（ch 依赖字体实际字形宽度，在回退字体下会漂移）。
+   序号在 main.js 中已零填充为等宽（[#01/36]…[#36/36]），此处再给一个固定下限，
+   保证任意等宽字体/字号下所有编号都占同一列。 */
+.term-body .line .acct-tag {
+  display: inline-block;
+  min-width: 72px;
+  color: #6e7681;
+}
+
+/* 详细日志行：默认（简化模式）隐藏，切到 .term.verbose 时才显示。
+   用 display 而非 visibility，避免隐藏行仍占用滚动高度。 */
+.term:not(.verbose) .term-body .line.muted-line { display: none; }
+
+/* 折叠汇总行：灰色斜体，与「// 注释」风格一致，不抢眼。 */
+.term-body .line.skip-summary { color: var(--dim); font-style: italic; }
+.term.verbose .term-body .line.skip-summary { display: none; }
+
+/* 开关按钮激活态 */
+#btn-toggle-verbose[aria-pressed="true"] {
+  color: var(--green);
+  border-color: var(--green);
+}
 
 /* ANSI 颜色 */
 .c-red { color: var(--red); }

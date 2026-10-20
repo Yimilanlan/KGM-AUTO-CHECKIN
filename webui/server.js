@@ -21,6 +21,11 @@
  *   ACCOUNTS_LOCK_MINUTES 锁定时长（默认 5 分钟）
  *   WEBUI_API_PORT    登录用 API 服务端口（默认 3010）
  *   CHECKIN_API_PORT  签到子进程 API 服务端口（默认 3020）
+ *   WEBUI_PHONE_SEND_IP_LIMIT    发送验证码的 IP 限流，格式 "次数/分钟"（默认 "3/60"，即每 IP 每小时 3 次）
+ *   WEBUI_PHONE_SEND_PHONE_LIMIT 发送验证码的手机号限流，格式 "次数/分钟"（默认 "2/1440"，即每号 24 小时 2 次）
+ *   WEBUI_QR_GEN_IP_LIMIT        生成登录二维码的 IP 限流，格式 "次数/分钟"（默认 "1/3"，即每 IP 3 分钟 1 次）
+ *                     以上三项限流均对「内网/本机」来源豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
+ *                     否则公网请求会被视为来自代理内网地址而全部豁免，限流形同虚设。
  *   CRON_SCHEDULE     签到计划任务（默认 "10 1 * * *"，每天北京时间 01:10）
  *   CRON_TIMEZONE     调度时区（默认 Asia/Shanghai）
  *   RUN_ON_STARTUP    "true" 时容器启动后立即执行一次签到
@@ -41,6 +46,7 @@ import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/useri
 import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 import { nextCronRuns } from '../utils/date.js'
+import { readVipExpiries as readVipExpiriesFromFile } from '../utils/checkinStatus.js'
 
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
@@ -50,11 +56,32 @@ const ROOT = path.resolve(__dirname, '..')
 
 // ────────────────────────── 配置 ──────────────────────────
 
+/**
+ * 解析布尔型环境变量：只有 1/true/yes/on 视为开启。
+ * 直接写 `if (process.env.X)` 会把 "0"、"false" 这类字符串也当成开启。
+ */
+function envFlag(name) {
+  return ['1', 'true', 'yes', 'on'].includes(String(process.env[name] || '').trim().toLowerCase())
+}
+
+/**
+ * 解析 WEBUI_TRUST_PROXY：既支持布尔开关，也支持「信任的代理跳数」。
+ * 返回 false 表示不信任；true 表示信任全部；数字表示信任的跳数。
+ */
+function parseTrustProxy(raw) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (!s || ['0', 'false', 'no', 'off'].includes(s)) return false
+  if (['true', 'yes', 'on'].includes(s)) return true
+  const hop = parseInt(s, 10)
+  return Number.isInteger(hop) && hop > 0 ? hop : false
+}
+
 const WEBUI_PORT = Number(process.env.WEBUI_PORT || 3000)
 const WEBUI_PASSWORD = String(process.env.WEBUI_PASSWORD || '').trim()
 // 仅当显式配置时才信任 X-Forwarded-For（反向代理部署）。默认关闭：
 // 无条件信任会让攻击者伪造 XFF 头绕过按 IP 的防爆破计数。
-const WEBUI_TRUST_PROXY = process.env.WEBUI_TRUST_PROXY
+const WEBUI_TRUST_PROXY_RAW = process.env.WEBUI_TRUST_PROXY
+const WEBUI_TRUST_PROXY = parseTrustProxy(WEBUI_TRUST_PROXY_RAW)
 const ACCOUNTS_PASSWORD = String(process.env.ACCOUNTS_PASSWORD || '').trim()
 const ACCOUNTS_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.ACCOUNTS_MAX_ATTEMPTS || '3', 10))
 const ACCOUNTS_LOCK_MINUTES = Math.max(0.01, parseFloat(process.env.ACCOUNTS_LOCK_MINUTES || '5'))
@@ -67,17 +94,215 @@ const ACCOUNTS_IP_MAX_ATTEMPTS = Math.max(
 // 未设置密码的账号是否允许以「酷狗ID 作为默认密码」登录（默认允许，便于用户首次改密）。
 // 设为 true 可关闭该行为，此时未设密码的账号必须由 admin 先设置密码。
 // ⚠ 酷狗ID 并非秘密，开启默认密码意味着知道 ID 的人即可登录并改密，公网部署请谨慎。
-const ACCOUNTS_DISABLE_ID_DEFAULT = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.ACCOUNTS_DISABLE_ID_DEFAULT || '').trim().toLowerCase()
-)
+const ACCOUNTS_DISABLE_ID_DEFAULT = envFlag('ACCOUNTS_DISABLE_ID_DEFAULT')
 // 首次启动用于初始化 admin 的引导密码（accounts_auth.json 不存在时使用）
 const ACCOUNTS_BOOTSTRAP_PASSWORD = String(process.env.ACCOUNTS_BOOTSTRAP_PASSWORD || '').trim()
 const WEBUI_API_PORT = process.env.WEBUI_API_PORT || '3010'
 const CHECKIN_API_PORT = process.env.CHECKIN_API_PORT || '3020'
 const SCHEDULE = process.env.CRON_SCHEDULE || '10 1 * * *'
 const TIMEZONE = process.env.CRON_TIMEZONE || 'Asia/Shanghai'
-const RUN_ON_STARTUP = ['1', 'true', 'yes', 'on'].includes(String(process.env.RUN_ON_STARTUP || '').toLowerCase())
+const RUN_ON_STARTUP = envFlag('RUN_ON_STARTUP')
 const IDLE_SHUTDOWN_MS = 10 * 60 * 1000
+
+// ── 手动「立即签到」限流 ──
+// 防止公网用户反复触发签到（每次都会拉起 API 子进程并请求酷狗接口）。
+// 默认同一 IP 12 小时内仅可触发一次；设为 0 可完全关闭。
+// 内网 / 本机来源豁免（见 isPrivateIp），不影响本机运维与反向代理转发。
+const CHECKIN_MANUAL_COOLDOWN_HOURS = (() => {
+  const raw = String(process.env.CHECKIN_MANUAL_COOLDOWN_HOURS ?? '').trim()
+  if (raw === '') return 12                 // 默认 12 小时
+  const n = parseFloat(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 12
+})()
+const CHECKIN_MANUAL_COOLDOWN_MS = CHECKIN_MANUAL_COOLDOWN_HOURS * 60 * 60 * 1000
+// ip -> 上次成功触发的时间戳（毫秒）。仅保留未过期的桶，避免无限增长。
+const manualCheckinLastAt = new Map()
+const MANUAL_CHECKIN_MAP_MAX = 5000
+
+/**
+ * 查询某 IP 的手动签到冷却状态。
+ * @param {string} ip
+ * @returns {{ blocked: boolean, remainingMs: number, lastAt: number }}
+ */
+function manualCheckinCooldown(ip) {
+  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return { blocked: false, remainingMs: 0, lastAt: 0 }
+  const key = normalizeIp(ip)
+  const lastAt = manualCheckinLastAt.get(key) || 0
+  const elapsed = Date.now() - lastAt
+  const remainingMs = lastAt ? Math.max(0, CHECKIN_MANUAL_COOLDOWN_MS - elapsed) : 0
+  return { blocked: remainingMs > 0, remainingMs, lastAt }
+}
+
+/** 记录某 IP 的一次成功触发，并顺带清理过期桶。 */
+function markManualCheckin(ip) {
+  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return
+  const now = Date.now()
+  const key = normalizeIp(ip)
+  manualCheckinLastAt.set(key, now)
+  if (manualCheckinLastAt.size > MANUAL_CHECKIN_MAP_MAX) {
+    for (const [k, v] of manualCheckinLastAt) {
+      if (now - v >= CHECKIN_MANUAL_COOLDOWN_MS) manualCheckinLastAt.delete(k)
+    }
+  }
+}
+
+// ── 单账号签到的每日配额 ──
+// 按 userid 计数（不分 IP）：每天最多 CHECKIN_PER_USERID_DAILY 次。
+// 与上面的 IP 冷却相互独立，两者都作用于「单账号签到」；
+// admin 验证后的「全部账号签到」不占用该配额。
+const CHECKIN_PER_USERID_DAILY = (() => {
+  const raw = String(process.env.CHECKIN_PER_USERID_DAILY ?? '').trim()
+  if (raw === '') return 2
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) && n >= 0 ? n : 2
+})()
+// userid -> { date: 'YYYY-MM-DD', count: N, lastAt: ms }
+const perUseridUsage = new Map()
+const PER_USERID_MAP_MAX = 5000
+
+/** 北京时间日期字符串（与 main.js 的调度口径一致）。 */
+function beijingToday() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date())
+}
+
+/**
+ * 查询某 userid 今日已用次数。
+ * @param {string} userid
+ * @returns {{ used: number, limit: number, remaining: number }}
+ */
+function perUseridQuota(userid) {
+  const today = beijingToday()
+  const rec = perUseridUsage.get(String(userid))
+  const used = rec && rec.date === today ? rec.count : 0
+  return { used, limit: CHECKIN_PER_USERID_DAILY, remaining: Math.max(0, CHECKIN_PER_USERID_DAILY - used) }
+}
+
+/** 记录某 userid 的一次单账号签到（跨天自动归零）。 */
+function markPerUseridUsed(userid) {
+  if (CHECKIN_PER_USERID_DAILY <= 0) return
+  const today = beijingToday()
+  const key = String(userid)
+  const rec = perUseridUsage.get(key)
+  const count = rec && rec.date === today ? rec.count + 1 : 1
+  perUseridUsage.set(key, { date: today, count, lastAt: Date.now() })
+  if (perUseridUsage.size > PER_USERID_MAP_MAX) {
+    for (const [k, v] of perUseridUsage) {
+      if (v.date !== today) perUseridUsage.delete(k)
+    }
+  }
+}
+
+/** 把剩余毫秒格式化为「X 小时 Y 分钟」（中文提示用）。 */
+function formatRemaining(ms) {
+  const totalMin = Math.max(1, Math.ceil(ms / 60000))
+  const h = Math.floor(totalMin / 60)
+  const m = totalMin % 60
+  if (h > 0 && m > 0) return `${h} 小时 ${m} 分钟`
+  if (h > 0) return `${h} 小时`
+  return `${m} 分钟`
+}
+
+// ── 通用滑动窗口限流 ──
+// 保护会向酷狗发起真实请求、且可被公网匿名调用的接口（发送验证码 / 生成登录二维码）。
+// 采用时间戳数组的滑动窗口：窗口内计数达到上限即拒绝，并返回剩余等待时间。
+// 与上面的手动签到限流一致，内网/本机来源豁免（公网部署需正确设置 WEBUI_TRUST_PROXY）。
+
+/**
+ * 解析 "次数/分钟" 形式的限流配置，为空或非法时回落默认值。
+ * @param {string|undefined} raw
+ * @param {number} defCount
+ * @param {number} defMinutes
+ * @returns {{ count: number, windowMs: number }}
+ */
+function parseRateSpec(raw, defCount, defMinutes) {
+  const fallback = { count: defCount, windowMs: defMinutes * 60 * 1000 }
+  const s = String(raw ?? '').trim()
+  if (s === '') return fallback
+  const m = s.match(/^(\d+)\s*\/\s*(\d+(?:\.\d+)?)$/)
+  if (!m) return fallback
+  const count = parseInt(m[1], 10)
+  const minutes = parseFloat(m[2])
+  if (!Number.isFinite(count) || !Number.isFinite(minutes)) return fallback
+  return { count, windowMs: minutes * 60 * 1000 }
+}
+
+const PHONE_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_IP_LIMIT, 3, 60)
+const PHONE_SEND_PHONE_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_PHONE_LIMIT, 2, 24 * 60)
+const QR_GEN_IP_LIMIT = parseRateSpec(process.env.WEBUI_QR_GEN_IP_LIMIT, 1, 3)
+
+// key -> 窗口内命中时间戳数组（递增）。桶数超过 RATE_MAP_MAX 时清理过期桶，避免内存无限增长。
+const rateBuckets = new Map()
+const RATE_MAP_MAX = 5000
+
+/** 取桶并丢弃窗口外的旧时间戳。 */
+function rateBucket(key, windowMs) {
+  const now = Date.now()
+  const cutoff = now - windowMs
+  let hits = rateBuckets.get(key)
+  if (!hits) {
+    hits = []
+    rateBuckets.set(key, hits)
+  }
+  while (hits.length && hits[0] <= cutoff) hits.shift()
+  if (rateBuckets.size > RATE_MAP_MAX) {
+    for (const [k, v] of rateBuckets) {
+      if (!v.length || v[v.length - 1] <= cutoff) rateBuckets.delete(k)
+    }
+  }
+  return hits
+}
+
+/**
+ * 检查并记录一次访问。
+ * @param {string} key 桶标识（含维度前缀，如 `sms:ip:1.2.3.4`）
+ * @param {{ count: number, windowMs: number }} spec
+ * @returns {{ allowed: boolean, retryAfterMs: number }}
+ */
+function rateLimitHit(key, spec) {
+  if (!spec || spec.count <= 0 || spec.windowMs <= 0) return { allowed: true, retryAfterMs: 0 }
+  const hits = rateBucket(key, spec.windowMs)
+  if (hits.length >= spec.count) {
+    return { allowed: false, retryAfterMs: Math.max(0, hits[0] + spec.windowMs - Date.now()) }
+  }
+  hits.push(Date.now())
+  return { allowed: true, retryAfterMs: 0 }
+}
+
+/** 剩余秒数的人类可读形式。 */
+function formatWait(secs) {
+  if (secs >= 3600) {
+    const h = Math.floor(secs / 3600)
+    const m = Math.ceil((secs % 3600) / 60)
+    return m > 0 ? `${h} 小时 ${m} 分钟` : `${h} 小时`
+  }
+  if (secs >= 60) return `${Math.ceil(secs / 60)} 分钟`
+  return `${secs} 秒`
+}
+
+/** 限流规格的可读描述（启动横幅用）。 */
+function describeRateLimit(spec) {
+  if (!spec || spec.count <= 0 || spec.windowMs <= 0) return '已关闭'
+  return `每 ${formatWait(Math.round(spec.windowMs / 1000))} ${spec.count} 次`
+}
+
+/**
+ * 超过限流时抛出 429（错误中间件会附带 Retry-After 头与响应体 retryAfter 字段）。
+ * @param {string} key
+ * @param {{ count: number, windowMs: number }} spec
+ * @param {string} label 提示语主语，如「验证码发送」
+ */
+function enforceRateLimit(key, spec, label) {
+  const r = rateLimitHit(key, spec)
+  if (r.allowed) return
+  const secs = Math.max(1, Math.ceil(r.retryAfterMs / 1000))
+  const err = new Error(`${label}过于频繁，请 ${formatWait(secs)}后再试`)
+  err.status = 429
+  err.code = 'rate-limited'
+  err.retryAfterMs = r.retryAfterMs
+  throw err
+}
 
 // 本进程内 utils（startService/send/waitForApi）统一使用登录专用端口
 process.env.API_PORT = WEBUI_API_PORT
@@ -212,17 +437,54 @@ function broadcast(event, data) {
  * 子进程通过 API_PORT 使用独立端口拉起自己的 API 服务，与登录服务互不冲突；
  * 凭据优先取挂载卷文件内容，其次继承环境变量 USERINFO。
  */
-function startCheckin(trigger = 'manual') {
+/**
+ * 结束一次签到：复位运行状态并广播（exit 与 spawn error 共用）。
+ * 重复调用是安全的（状态已复位也只会再广播一次结束事件）。
+ * @param {number} exitCode
+ */
+function finishCheckin(exitCode) {
+  checkinState.running = false
+  checkinState.currentOnlyUserid = null
+  checkinState.lastRun = {
+    ...checkinState.lastRun,
+    endedAt: new Date().toISOString(),
+    exitCode,
+    ok: exitCode === 0,
+    running: false,
+  }
+  pushLog(exitCode === 0 ? 'ok' : 'err', `────── 签到任务结束（退出码 ${exitCode}）──────`)
+  broadcast('end', checkinState.lastRun)
+}
+
+function startCheckin(trigger = 'manual', options = {}) {
   if (checkinState.running) return false
+
+  // 单账号模式：仅把该账号的凭据传给子进程，实现"用 userid 执行对应账号的签到"
+  const onlyUserid = options.onlyUserid ? String(options.onlyUserid) : null
 
   checkinState.running = true
   const startedAt = new Date().toISOString()
-  checkinState.lastRun = { startedAt, trigger, running: true }
+  checkinState.lastRun = { startedAt, trigger, running: true, onlyUserid }
+  checkinState.currentOnlyUserid = onlyUserid
 
-  pushLog('sys', `────── 签到任务开始（${trigger === 'cron' ? '定时调度' : trigger === 'startup' ? '启动触发' : '手动触发'} · ${startedAt}）──────`)
+  const triggerLabel = trigger === 'cron' ? '定时调度'
+    : trigger === 'startup' ? '启动触发'
+    : onlyUserid ? `手动触发 · 账号 ${maskIdentifier(onlyUserid)}`
+    : '手动触发'
+  pushLog('sys', `────── 签到任务开始（${triggerLabel} · ${startedAt}）──────`)
   broadcast('start', checkinState.lastRun)
 
-  const userinfoRaw = readUserinfoRaw()
+  let userinfoRaw = readUserinfoRaw()
+  if (onlyUserid) {
+    // 只保留目标账号；从原始数组过滤，确保其它账号的 token 完全不进入子进程
+    try {
+      const arr = parseUserinfoJson(userinfoRaw) || []
+      const target = arr.filter(u => String(u.userid) === onlyUserid)
+      userinfoRaw = JSON.stringify(target)
+    } catch {
+      userinfoRaw = ''
+    }
+  }
 
   // 凭据通过 stdin 传给子进程，而不是放进环境变量：
   // 环境变量可被同容器/同主机的其他进程经 /proc/<pid>/environ 读取，等于把 token 暴露给任意进程。
@@ -233,12 +495,23 @@ function startCheckin(trigger = 'manual') {
   if (trigger === 'manual') {
     env.CHECKIN_SKIP_DONE = '1'
   }
+  // 让子进程把各账号的 VIP 到期时间写盘，供「账号管理」面板展示
+  // （日志里不再刷「VIP到期时间」，避免每账号 2 行噪音）
+  env.CHECKIN_STATUS_FILE = checkinStatusFile()
 
-  const child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
-    cwd: ROOT,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  let child
+  try {
+    child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
+      cwd: ROOT,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (e) {
+    // 某些环境下 spawn 会同步抛错（如沙箱 EPERM）；必须复位状态，否则永久 409
+    pushLog('err', `签到进程启动失败：${e.message}`)
+    finishCheckin(1)
+    throw e
+  }
 
   // 写入凭据后立即关闭 stdin，供子进程读取
   if (userinfoRaw) {
@@ -257,21 +530,14 @@ function startCheckin(trigger = 'manual') {
   child.stderr.on('data', onStream)
 
   child.on('error', err => {
+    // spawn 失败（EPERM/ENOMEM/EACCES 等）时子进程不会触发 exit，若不在这里复位，
+    // checkinState.running 会永久为 true，之后所有签到请求都返回 409。
     pushLog('err', `签到进程启动失败：${err.message}`)
+    finishCheckin(1)
   })
 
   child.on('exit', code => {
-    const exitCode = code ?? 1
-    checkinState.running = false
-    checkinState.lastRun = {
-      ...checkinState.lastRun,
-      endedAt: new Date().toISOString(),
-      exitCode,
-      ok: exitCode === 0,
-      running: false,
-    }
-    pushLog(exitCode === 0 ? 'ok' : 'err', `────── 签到任务结束（退出码 ${exitCode}）──────`)
-    broadcast('end', checkinState.lastRun)
+    finishCheckin(code ?? 1)
   })
 
   return true
@@ -289,9 +555,8 @@ function nextRuns(n = 3) {
 const app = express()
 app.disable('x-powered-by')
 // 仅在显式配置 WEBUI_TRUST_PROXY 时才信任反向代理头（否则 XFF 可被伪造以绕过防爆破）
-if (WEBUI_TRUST_PROXY) {
-  const hop = parseInt(WEBUI_TRUST_PROXY, 10)
-  app.set('trust proxy', Number.isInteger(hop) && hop > 0 ? hop : true)
+if (WEBUI_TRUST_PROXY !== false) {
+  app.set('trust proxy', WEBUI_TRUST_PROXY)
 }
 app.use(express.json())
 app.use(express.static(path.join(__dirname, 'public')))
@@ -305,6 +570,41 @@ function clientIp(req) {
 function isLoopback(req) {
   const ip = clientIp(req)
   return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+}
+
+/**
+ * 归一化 IP：去掉 IPv4-mapped IPv6 前缀，便于统一比较。
+ * @param {string} ip
+ * @returns {string}
+ */
+function normalizeIp(ip) {
+  const s = String(ip || '').trim().toLowerCase()
+  return s.startsWith('::ffff:') ? s.slice(7) : s
+}
+
+/**
+ * 是否为内网 / 本机地址（RFC1918 + 回环 + IPv6 链路本地与 ULA）。
+ * 用于「手动签到」限流豁免：内网运维操作不应被外网防滥用策略误伤。
+ * 注意：这只是可用性豁免，不是安全边界——外网请求经反向代理后 req.ip
+ * 为代理内网地址时会被豁免，因此 WEBUI_TRUST_PROXY 必须正确配置。
+ * @param {string} rawIp
+ * @returns {boolean}
+ */
+function isPrivateIp(rawIp) {
+  const ip = normalizeIp(rawIp)
+  if (!ip) return false
+  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true
+  // IPv6 链路本地 fe80::/10 与 ULA fc00::/7
+  if (ip.includes(':')) return ip.startsWith('fe80:') || /^f[cd][0-9a-f]{2}:/.test(ip)
+  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return false
+  const [a, b] = [Number(m[1]), Number(m[2])]
+  if (a === 10) return true                       // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
+  if (a === 192 && b === 168) return true          // 192.168.0.0/16
+  if (a === 169 && b === 254) return true          // 169.254.0.0/16（含 Docker 内网）
+  if (a === 127) return true                       // 127.0.0.0/8
+  return false
 }
 
 /** 计时安全的字符串比较（先散列到等长，避免时序侧信道） */
@@ -595,6 +895,64 @@ function accountsGuard(req, res, next) {
   })
 }
 
+/**
+ * 校验 admin 凭据，并把失败计入与 /api/accounts 相同的防爆破桶。
+ *
+ * ⚠ /api/checkin/run 的「全部账号签到」不在 accountsGuard 作用域内。若此处不计失败，
+ * 攻击者可在该端点上无限次猜解 admin 密码（两个入口共享同一份 admin 密码）。
+ * 两个入口共用 failsByIp / failsByAcct，任一入口触发锁定即全局生效。
+ *
+ * @returns {{ scope: object|null, locked: boolean, retryAfter: number, message: string }}
+ */
+function verifyAdminGuarded(req) {
+  const ip = clientIp(req)
+  const now = Date.now()
+
+  const ipSt = bucketState(failsByIp, ip)
+  if (ipSt.lockUntil > now) {
+    const left = Math.ceil((ipSt.lockUntil - now) / 1000)
+    return { scope: null, locked: true, retryAfter: left, message: `尝试次数过多，已锁定，请 ${left} 秒后再试` }
+  }
+  const acctSt = bucketState(failsByAcct, 'admin')
+  if (acctSt.lockUntil > now) {
+    const left = Math.ceil((acctSt.lockUntil - now) / 1000)
+    return { scope: null, locked: true, retryAfter: left, message: `admin 密码错误次数过多，已锁定，请 ${left} 秒后再试` }
+  }
+
+  const { id, key } = providedAccountsCreds(req)
+  if (!id || !key) {
+    // 未提供凭据不算失败（与 accountsGuard 一致）：用户可能只是先点了按钮，
+    // 否则连点几次就会把 admin 把自己锁掉。
+    return { scope: null, locked: false, retryAfter: 0, message: '全部账号签到需要管理员（admin）账号与密码验证' }
+  }
+  const scope = verifyAccountsCreds(id, key, req)
+  if (scope && scope.admin) {
+    clearFails(failsByIp, ip)
+    clearFails(failsByAcct, 'admin')
+    return { scope, locked: false, retryAfter: 0, message: '' }
+  }
+
+  // 失败：与 /api/accounts 完全一致的计数与阈值
+  const acctLocked = registerFail(failsByAcct, 'admin', ACCOUNTS_MAX_ATTEMPTS, now)
+  const ipLocked = registerFail(failsByIp, ip, ACCOUNTS_IP_MAX_ATTEMPTS, now)
+  if (acctLocked || ipLocked) {
+    printRed(`[webui] 全量签到：${ip} admin 验证连续失败，锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`)
+    return {
+      scope: null,
+      locked: true,
+      retryAfter: Math.ceil(ACCOUNTS_LOCK_MS / 1000),
+      message: `密码错误次数过多，已锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`,
+    }
+  }
+  const left = Math.max(0, ACCOUNTS_MAX_ATTEMPTS - bucketState(failsByAcct, 'admin').fails)
+  return {
+    scope: null,
+    locked: false,
+    retryAfter: 0,
+    message: `管理员账号或密码错误，剩余尝试次数 ${left}`,
+  }
+}
+
 app.use('/api/accounts', accountsGuard)
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
@@ -633,6 +991,10 @@ app.get('/api/status', wrap(async (req, res) => {
 
 // ── 扫码登录 ──
 app.post('/api/qr/gen', wrap(async (req, res) => {
+  // 每次生成都会向酷狗申请新的登录 key，按 IP 限流（内网/本机豁免）
+  const qrIp = normalizeIp(clientIp(req))
+  if (!isPrivateIp(qrIp)) enforceRateLimit(`qr:${qrIp}`, QR_GEN_IP_LIMIT, '二维码生成')
+
   const number = Math.min(5, Math.max(1, parseInt(req.body?.number, 10) || 1))
   const items = []
   await withApi(async () => {
@@ -698,6 +1060,12 @@ function describeUpstreamError(r) {
 app.post('/api/phone/send', wrap(async (req, res) => {
   const phone = String(req.body?.phone || '').trim()
   assertPhone(phone)
+  // 双重限流：IP 维度防止换号刷量，手机号维度防止针对某一号码轰炸（内网/本机豁免）
+  const smsIp = normalizeIp(clientIp(req))
+  if (!isPrivateIp(smsIp)) {
+    enforceRateLimit(`sms:ip:${smsIp}`, PHONE_SEND_IP_LIMIT, '验证码发送')
+    enforceRateLimit(`sms:phone:${phone}`, PHONE_SEND_PHONE_LIMIT, '该手机号的验证码发送')
+  }
   const r = await withApi(() => send(`/captcha/sent?mobile=${phone}`, 'GET', {}))
   if (r?.status !== 1) {
     const err = new Error(`验证码发送失败：${describeUpstreamError(r)}`)
@@ -739,6 +1107,10 @@ app.post('/api/phone/login', wrap(async (req, res) => {
 }))
 
 // ── 一键签到 ──
+// 两种模式：
+//   1) 单账号：请求体传 userid → 只签该账号，每个 userid 每天最多 N 次（默认 2）
+//   2) 全量：请求头带 admin 凭据（X-Accounts-Id / X-Accounts-Key）→ 签所有账号，
+//      不占单账号配额，仍沿用「今日已签到则跳过」机制
 app.post('/api/checkin/run', wrap(async (req, res) => {
   if (checkinState.running) {
     const err = new Error('签到任务正在进行中，请稍候')
@@ -751,8 +1123,88 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     err.status = 400
     throw err
   }
+
+  const ip = clientIp(req)
+  const rawUserid = req.body?.userid != null ? String(req.body.userid).trim() : ''
+
+  // ── 模式一：指定 userid，只签该账号 ──
+  if (rawUserid) {
+    const target = accounts.find(u => String(u.userid) === rawUserid)
+    if (!target) {
+      const err = new Error('该 userid 不在已配置的账号中，请先在「扫码登录」或「手机号登录」中添加')
+      err.status = 404
+      throw err
+    }
+
+    // ① 每 userid 每天 N 次（不分 IP，全局计数）
+    if (CHECKIN_PER_USERID_DAILY > 0) {
+      const q = perUseridQuota(rawUserid)
+      if (q.remaining <= 0) {
+        const err = new Error(
+          `账号 ${maskIdentifier(rawUserid)} 今日已手动签到 ${q.used} 次，达到上限（${q.limit} 次/天），请明日再试`
+        )
+        err.status = 429
+        err.code = 'per-userid-quota-exceeded'
+        throw err
+      }
+    }
+
+    // ② 公网来源仍受 IP 冷却约束，防止单人反复刷不同账号
+    if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+      const cd = manualCheckinCooldown(ip)
+      if (cd.blocked) {
+        const err = new Error(
+          `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
+        )
+        err.status = 429
+        err.code = 'manual-checkin-cooldown'
+        err.retryAfterMs = cd.remainingMs
+        throw err
+      }
+    }
+
+    startCheckin('manual', { onlyUserid: rawUserid })
+    if (CHECKIN_PER_USERID_DAILY > 0) markPerUseridUsed(rawUserid)
+    if (!isPrivateIp(ip)) markManualCheckin(ip)
+    const q = perUseridQuota(rawUserid)
+    return res.status(202).json({ ok: true, mode: 'single', userid: maskIdentifier(rawUserid), remaining: q.remaining })
+  }
+
+  // ── 模式二：全部账号，必须通过 admin 验证（失败计入防爆破，与 /api/accounts 共用桶） ──
+  const admin = verifyAdminGuarded(req)
+  if (!admin.scope) {
+    const err = new Error(admin.message)
+    err.status = admin.locked ? 423 : 401
+    err.code = admin.locked ? 'accounts-auth' : 'admin-required'
+    if (admin.retryAfter > 0) err.retryAfterMs = admin.retryAfter * 1000
+    throw err
+  }
+
+  // admin 全量签到不占单账号配额；仍受 IP 冷却约束，避免被反复触发拖垮接口
+  if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+    const cd = manualCheckinCooldown(ip)
+    if (cd.blocked) {
+      const err = new Error(
+        `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
+      )
+      err.status = 429
+      err.code = 'manual-checkin-cooldown'
+      err.retryAfterMs = cd.remainingMs
+      throw err
+    }
+  }
+
   startCheckin('manual')
-  res.status(202).json({ ok: true })
+  if (!isPrivateIp(ip)) markManualCheckin(ip)
+  res.status(202).json({ ok: true, mode: 'all' })
+}))
+
+/** 单账号签到的今日配额查询（前端展示"今日剩余次数"用） */
+app.get('/api/checkin/quota', wrap(async (req, res) => {
+  const userid = req.query.userid != null ? String(req.query.userid).trim() : ''
+  if (!userid) return res.json({ limit: CHECKIN_PER_USERID_DAILY, perUserid: true })
+  const q = perUseridQuota(userid)
+  res.json({ userid: maskIdentifier(userid), limit: q.limit, used: q.used, remaining: q.remaining })
 }))
 
 app.get('/api/checkin/logs', (req, res) => {
@@ -780,6 +1232,20 @@ app.get('/api/checkin/logs', (req, res) => {
 })
 
 // ── 账号管理（受 accountsGuard 保护：每账号独立密码，admin 可管理全部）──
+
+/** 签到状态文件路径：由 main.js 写入各账号的 VIP 到期时间，账号管理面板读取展示。 */
+function checkinStatusFile() {
+  const base = process.env.USERINFO_FILE
+    ? path.dirname(process.env.USERINFO_FILE)
+    : path.join(ROOT, 'data')
+  return path.join(base, 'checkin_status.json')
+}
+
+/** 读取签到状态文件中的 VIP 到期时间映射（userid -> 到期时间）。失败返回空对象。
+ *  解析逻辑与 main.js 写盘共用 utils/checkinStatus.js，避免两边格式不一致。 */
+function readVipExpiries() {
+  return readVipExpiriesFromFile(checkinStatusFile())
+}
 
 /** 验证身份凭据（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
 app.post('/api/accounts/unlock', wrap(async (req, res) => {
@@ -827,16 +1293,20 @@ app.get('/api/accounts', wrap(async (req, res) => {
   const visible = scopeFilter(all, scope)
   const nicknames = await resolveAccountNicknames(visible.map(v => v.u))
   const auth = readAccountsAuth()
+  const vipExpiry = readVipExpiries()
   res.json({
     accounts: visible.map(({ u, i }, vi) => ({
       index: i,
-      userid: maskIdentifier(u.userid),
-      // 完整 userid 仅用于前端发起按 id 的删除（面板本身已受独立密码保护）
+      // userid 完整返回：面板整体受独立密码保护，脱敏会妨碍用户核对与搜索自己的账号
+      userid: String(u.userid),
+      // 兼容字段：前端删除等操作按完整 id 进行
       rawUserid: String(u.userid),
       nickname: nicknames[vi],
       tokenLength: String(u.token || '').length,
       // 是否已自行设置过密码：false 表示当前仍在使用「酷狗ID」作为默认密码
       hasPassword: Boolean(auth[String(u.userid)]),
+      // VIP 到期时间：来自最近一次签到写的状态文件；尚未签到时为 null
+      vipExpiry: vipExpiry[String(u.userid)] || null,
     })),
     admin: scope.admin,
     lockEnabled: true,
@@ -947,7 +1417,16 @@ app.use('/api', (req, res) => res.status(404).json({ error: '接口不存在' })
 app.use((err, req, res, next) => {
   const status = err.status || 500
   if (status >= 500) printRed(`[webui] ${req.method} ${req.path} 失败：${err.message}`)
-  res.status(status).json({ error: err.message })
+  // 限流类错误附带标准 Retry-After（秒），便于客户端/脚本自动等待
+  if (err.retryAfterMs > 0) {
+    res.set('Retry-After', String(Math.ceil(err.retryAfterMs / 1000)))
+  }
+  // 限流错误在响应体里也带上 retryAfter（秒），前端据此禁用按钮并倒计时
+  res.status(status).json({
+    error: err.message,
+    ...(err.code ? { code: err.code } : {}),
+    ...(err.retryAfterMs > 0 ? { retryAfter: Math.ceil(err.retryAfterMs / 1000) } : {}),
+  })
 })
 
 // ────────────────────────── 启动 ──────────────────────────
@@ -967,7 +1446,7 @@ app.listen(WEBUI_PORT, () => {
   printYellow(`  下次执行: ${nextRuns(1)[0] || '-'}`)
   printYellow(`  凭据文件: ${USERINFO_FILE}（${readUserinfo().length} 个账号）`)
   printYellow(`  访问密码: ${WEBUI_PASSWORD ? '已启用' : '未启用（仅建议在可信内网使用）'}`)
-  printYellow(`  账号管理: 每账号独立密码（scrypt）· admin ${ACCOUNTS_PASSWORD || readAccountsAuth().admin ? '已启用' : '未启用'} · 账号 ${ACCOUNTS_MAX_ATTEMPTS} 次 / IP ${ACCOUNTS_IP_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟`)
+  printYellow(`  账号管理: 每账号独立密码（scrypt）· admin ${ACCOUNTS_PASSWORD || readAccountsAuth().admin ? '已启用' : '未启用'} · 账号 ${ACCOUNTS_MAX_ATTEMPTS} 次 / IP ${ACCOUNTS_IP_MAX_ATTEMPTS} 次错误锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`)
   if (ACCOUNTS_DISABLE_ID_DEFAULT) {
     printYellow('  账号默认密码: 已关闭（未设密码的账号需由 admin 设置密码后才能登录）')
   } else {
@@ -978,8 +1457,24 @@ app.listen(WEBUI_PORT, () => {
   if (!readAccountsAuth().admin && !ACCOUNTS_PASSWORD) {
     printYellow('  提示：未配置 ACCOUNTS_PASSWORD，admin 不可用；可设 ACCOUNTS_BOOTSTRAP_PASSWORD 初始化 admin 密码')
   }
-  if (WEBUI_TRUST_PROXY) {
-    printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY}）`)
+  if (WEBUI_TRUST_PROXY !== false) {
+    printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY_RAW}）`)
+  } else {
+    // 未信任代理头时，公网请求会被视为来自代理内网地址，所有按 IP 的限制（含账号防爆破）都会被豁免
+    const raw = String(WEBUI_TRUST_PROXY_RAW ?? '').trim()
+    if (raw) {
+      printYellow(`  反向代理: 已明确关闭（WEBUI_TRUST_PROXY=${raw}），不信任 X-Forwarded-For`)
+    } else {
+      printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会全部被视为内网来源，')
+      printRed('    按 IP 的限流与账号防爆破计数将被豁免；公网部署请设为 1。')
+    }
+  }
+  printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
+  printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)
+  if (CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+    printYellow(`  手动签到限流: 同一 IP 每 ${CHECKIN_MANUAL_COOLDOWN_HOURS} 小时仅可触发一次（内网/本机豁免）`)
+  } else {
+    printYellow('  手动签到限流: 已关闭（CHECKIN_MANUAL_COOLDOWN_HOURS=0）')
   }
 
   if (cron.validate(SCHEDULE)) {
