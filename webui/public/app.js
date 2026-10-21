@@ -284,6 +284,10 @@ function renderAccountList() {
     const noPwdHint = acct.hasPassword
       ? ''
       : '<div class="acct-sub warn">⚠ 仍在使用默认密码（酷狗ID），建议尽快修改</div>'
+    // 凭据失效：酷狗明确返回 20018，只能重新登录；重跑签到不会恢复
+    const invalidHint = acct.credentialInvalid
+      ? `<div class="acct-sub bad">⚠ 登录凭据已失效，请重新登录${acct.credentialInvalidAt ? `（${escapeHtml(String(acct.credentialInvalidAt))} 检测）` : ''}</div>`
+      : ''
     // VIP 到期时间：签到不再把到期时间刷进日志，统一在此展示
     const vipHtml = acct.vipExpiry
       ? `<div class="acct-sub">VIP 到期: <span class="vip-expiry">${escapeHtml(String(acct.vipExpiry))}</span></div>`
@@ -294,6 +298,7 @@ function renderAccountList() {
       <div class="acct-main">
         <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${idHtml}</div>
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
+        ${invalidHint}
         ${vipHtml}
         ${noPwdHint}
       </div>`

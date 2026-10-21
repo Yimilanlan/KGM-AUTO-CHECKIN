@@ -46,7 +46,7 @@ import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/useri
 import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 import { nextCronRuns } from '../utils/date.js'
-import { readVipExpiries as readVipExpiriesFromFile } from '../utils/checkinStatus.js'
+import { clearInvalidCredential, readCheckinStatus } from '../utils/checkinStatus.js'
 
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
@@ -1032,6 +1032,7 @@ app.get('/api/qr/status', wrap(async (req, res) => {
       const arr = readUserinfo()
       upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token) }, true)
       const saved = saveUserinfo(arr)
+      if (saved) clearInvalidCredentialMark(r.data.userid)
       return { status: 4, userid: maskIdentifier(r.data.userid), saved }
     }
     return { status: s ?? -1 }
@@ -1092,6 +1093,7 @@ app.post('/api/phone/login', wrap(async (req, res) => {
     const arr = readUserinfo()
     upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token) }, true)
     const saved = saveUserinfo(arr)
+    if (saved) clearInvalidCredentialMark(r.data.userid)
     const userid = maskIdentifier(r.data.userid)
     printGreen(`[webui] 手机号登录成功，账号 ${userid} 已保存`)
     return res.json({ ok: true, userid, saved })
@@ -1241,10 +1243,17 @@ function checkinStatusFile() {
   return path.join(base, 'checkin_status.json')
 }
 
-/** 读取签到状态文件中的 VIP 到期时间映射（userid -> 到期时间）。失败返回空对象。
+/** 读取签到状态文件（VIP 到期时间 + 凭据失效标记）。失败返回空结构。
  *  解析逻辑与 main.js 写盘共用 utils/checkinStatus.js，避免两边格式不一致。 */
-function readVipExpiries() {
-  return readVipExpiriesFromFile(checkinStatusFile())
+function readCheckinStatusFile() {
+  return readCheckinStatus(checkinStatusFile())
+}
+
+/** 账号重新登录成功后清除「凭据失效」标记，避免面板一直挂着「需重新登录」的过期提示 */
+function clearInvalidCredentialMark(userid) {
+  try {
+    clearInvalidCredential(checkinStatusFile(), userid)
+  } catch { /* 清理失败不影响登录结果，下次签到成功时也会自动清除 */ }
 }
 
 /** 验证身份凭据（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
@@ -1293,7 +1302,9 @@ app.get('/api/accounts', wrap(async (req, res) => {
   const visible = scopeFilter(all, scope)
   const nicknames = await resolveAccountNicknames(visible.map(v => v.u))
   const auth = readAccountsAuth()
-  const vipExpiry = readVipExpiries()
+  const status = readCheckinStatusFile()
+  const vipExpiry = status.vipExpiry
+  const invalidCreds = status.invalidCreds
   res.json({
     accounts: visible.map(({ u, i }, vi) => ({
       index: i,
@@ -1307,6 +1318,9 @@ app.get('/api/accounts', wrap(async (req, res) => {
       hasPassword: Boolean(auth[String(u.userid)]),
       // VIP 到期时间：来自最近一次签到写的状态文件；尚未签到时为 null
       vipExpiry: vipExpiry[String(u.userid)] || null,
+      // 登录凭据是否已失效（酷狗返回 20018）：true 时面板提示「需重新登录」，重新登录成功后自动清除
+      credentialInvalid: Boolean(invalidCreds[String(u.userid)]),
+      credentialInvalidAt: invalidCreds[String(u.userid)] || null,
     })),
     admin: scope.admin,
     lockEnabled: true,

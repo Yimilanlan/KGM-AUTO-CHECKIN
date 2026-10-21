@@ -6,7 +6,7 @@ import { close_api, delay, send, startService, waitForApi } from "./utils/utils.
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
-import { mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
+import { mergeInvalidCreds, mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
 
 /**
  * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
@@ -82,6 +82,10 @@ async function main() {
   const notifyResults = []
   // userid -> VIP 到期时间（仅 WebUI 模式：设置 CHECKIN_STATUS_FILE 时收集并写盘）
   const vipExpiries = {}
+  // 本轮判定为「凭据失效」的账号（增量）：userid -> 失效日期；值为 null 表示本轮已恢复正常、需从文件里清除
+  const invalidCreds = {}
+  // 供日志与通知汇总的失效账号（按发现顺序），让用户一眼看出「该重新登录哪几个」
+  const invalidCredList = []
   let hasError = false
 
   // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
@@ -123,17 +127,31 @@ async function main() {
         const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
         if (userDetail?.data?.nickname == null) {
           const safeUserId = maskIdentifier(user.userid)
-          printRed(`${tag} token过期或账号不存在, userid: ${safeUserId}`)
+          // 区分「凭据真的失效」与「瞬时拒绝」：
+          //   20018 = 酷狗明确判定 token 失效/账号不存在 → 只能重新登录，写入状态文件供面板提示；
+          //   其它（如 20006）= 限流/风控类瞬时拒绝，同一 token 稍后重试即可成功，不能标记失效，
+          //   否则面板会误报「需重新登录」（实测 481***56 本轮 20006，随后连测 3 次全部正常）。
+          const credentialInvalid = userDetail?.error_code === 20018
+          const reason = credentialInvalid
+            ? '登录凭据已失效，需重新登录'
+            : `获取账号信息失败（error_code ${userDetail?.error_code ?? '未知'}）`
+          printRed(`${tag} ${reason}, userid: ${safeUserId}`)
           accountErrors[safeUserId] = {
-            msg: `token过期或账号不存在, userid: ${safeUserId}`,
+            msg: `${reason}, userid: ${safeUserId}`,
             data: summarizeResponse(userDetail)
           }
+          if (credentialInvalid) {
+            invalidCreds[String(user.userid)] = date
+            invalidCredList.push(safeUserId)
+          }
           return {
-            nickname: safeUserId, status: '失败', listen: '账号不存在',
-            vipClaim: '0/8', vipExpiry: '未知', error: 'token过期或账号不存在'
+            nickname: safeUserId, status: '失败', listen: credentialInvalid ? '凭据失效' : '账号信息获取失败',
+            vipClaim: '0/8', vipExpiry: '未知', error: reason
           }
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
+        // 本轮拿到昵称说明凭据可用：清除可能残留的「凭据失效」标记（值为 null = 删除）
+        invalidCreds[String(user.userid)] = null
         printMagenta(`${tag} 账号 ${safeNickname} 开始签到`)
 
         // 周日刷新token
@@ -307,11 +325,17 @@ async function main() {
   // 必须与文件里已有数据合并而不是整份覆盖：手动触发会跳过当日已签到的账号，
   // 被跳过的账号本轮不查询 VIP 详情，覆盖写会把之前（定时任务）写好的到期时间全部抹掉。
   if (statusFile) {
+    // 第三个参数 force：本轮只要产生了凭据状态变化（新标记或恢复正常）就必须落盘。
+    // 若恰好两个映射都为空（唯一账号恢复正常且拿不到 VIP 到期时间），
+    // 默认的「空则不写」会把旧标记留在文件里，面板就一直提示需重新登录。
+    const credentialChanged = Object.keys(invalidCreds).length > 0
     const result = writeCheckinStatus(statusFile, {
       date,
       vipExpiry: mergeVipExpiries(existingStatus.vipExpiry, vipExpiries),
+      // 凭据失效映射同样合并：本轮新判定的写入，本轮恢复正常的删除，没检查到的旧条目保留
+      invalidCreds: mergeInvalidCreds(existingStatus.invalidCreds, invalidCreds),
       vipExpiryAt,
-    })
+    }, credentialChanged)
     // 写盘失败不影响签到结果，但必须显式告警，否则面板会一直停在旧值
     if (!result.ok) printYellow(`警告：账号状态写入失败（${result.error}）`)
   }
@@ -362,6 +386,12 @@ async function main() {
     }
   }
 
+  // 凭据失效汇总：比逐条 error_code 更容易看出「该做什么」——这几个账号只能重新登录，
+  // 重跑签到不会恢复（酷狗已明确返回 20018）。放在通知之前打印，日志里一眼可见。
+  if (invalidCredList.length > 0) {
+    printRed(`⚠ ${invalidCredList.length} 个账号登录凭据已失效，需重新登录：${invalidCredList.join('、')}`)
+  }
+
   // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）
   const skipCount = notifyResults.filter(r => r.status === '跳过').length
   const allSkipped = skippedCount > 0 && skippedCount === notifyResults.length
@@ -389,6 +419,9 @@ async function main() {
   const successCount = notifyResults.filter(r => r.status === '成功').length
   const failCount = notifyResults.length - successCount - skipCount
   content += `✅ 成功: ${successCount}  ⏭ 跳过: ${skipCount}  ❌ 失败: ${failCount}\n`
+  if (invalidCredList.length > 0) {
+    content += `⚠️ 需重新登录: ${invalidCredList.join('、')}\n`
+  }
 
   for (const r of notifyResults) {
     content += `\n【${r.nickname}】\n`

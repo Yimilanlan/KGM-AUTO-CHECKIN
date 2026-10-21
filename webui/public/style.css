@@ -425,6 +425,10 @@ select.input { width: auto; min-width: 80px; }
 .account-item .acct-main { display: flex; flex-direction: column; }
 .account-item .acct-id { color: var(--cyan); }
 .account-item .acct-sub { font-size: 12px; color: var(--dim); }
+/* 凭据失效：酷狗已明确返回 20018，只能重新登录，签到重跑不会恢复 */
+.account-item .acct-sub.bad { color: var(--red); }
+/* 仍在使用默认密码的提醒 */
+.account-item .acct-sub.warn { color: var(--yellow); }
 .account-item .idx { color: var(--magenta); margin-right: 8px; }
 .account-item .acct-name { color: var(--yellow); font-weight: bold; }
 .account-item .acct-sep { color: var(--dim); margin: 0 8px; }
